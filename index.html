@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ant Colony Tree Viewer</title>
+<style>
+  :root { --bg:#0f1218; --panel:#171c26; --line:#2a3242; --fg:#dde3ee; --dim:#8a94a6; --acc:#5aa9ff; --ok:#4cd28a; --bad:#ff6b6b; --warn:#f2c14e; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.4 ui-monospace,Menlo,Consolas,monospace; height:100vh; display:flex; flex-direction:column; }
+  header { display:flex; gap:8px; align-items:center; padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header input { background:#0b0e14; color:var(--fg); border:1px solid var(--line); padding:6px 8px; font:inherit; }
+  #bob { width:230px; } #ident { width:520px; letter-spacing:.5px; }
+  button { background:#22304a; color:var(--fg); border:1px solid #365079; padding:6px 10px; font:inherit; cursor:pointer; }
+  button:hover { background:#2b3d5e; } button:disabled { opacity:.5; cursor:default; }
+  #status { color:var(--dim); flex-basis:100%; white-space:pre-wrap; }
+  main { flex:1; display:flex; min-height:0; }
+  #left { flex:1; overflow:auto; padding:8px 12px; border-right:1px solid var(--line); }
+  #right { width:46%; min-width:380px; overflow:auto; padding:10px 14px; }
+  #stats { color:var(--dim); margin-bottom:8px; }
+  #left { padding:0; overflow:hidden; position:relative; }
+  #stats { position:absolute; left:10px; top:8px; z-index:2; background:rgba(23,28,38,.85); padding:4px 8px; border-radius:4px; }
+  #legend { position:absolute; left:10px; bottom:8px; z-index:2; color:var(--dim); background:rgba(23,28,38,.85); padding:4px 8px; border-radius:4px; }
+  svg { width:100%; height:100%; cursor:grab; display:block; } svg.drag { cursor:grabbing; }
+  .node rect { fill:#1b2431; stroke:#4f7bbf; stroke-width:1.5; rx:4; }
+  .node text { fill:var(--fg); text-anchor:middle; pointer-events:none; }
+  .node .sc { font-size:13px; font-weight:bold; } .node .lk { font-size:9px; fill:var(--dim); }
+  .node.rej rect { stroke:var(--bad); stroke-dasharray:4 3; fill:#2a1a1a; } .node.rej .sc { fill:var(--bad); }
+  .node.best rect { stroke:var(--warn); stroke-width:3; fill:#3a3010; } .node.best .sc { fill:var(--warn); }
+  .node.root rect { fill:#22304a; stroke:var(--acc); } 
+  .node.sel rect { stroke:#fff; stroke-width:3; }
+  .node:hover rect { filter:brightness(1.3); }
+  .edge { stroke:#3d4b63; stroke-width:1.5; fill:none; } .edge.rej { stroke:#6b3a3a; stroke-dasharray:4 3; }
+  table { border-collapse:collapse; width:100%; }
+  td { padding:3px 6px; vertical-align:top; border-bottom:1px solid var(--line); word-break:break-all; }
+  td:first-child { color:var(--dim); white-space:nowrap; width:150px; }
+  h3 { margin:6px 0 8px; font-size:14px; } .ok { color:var(--ok); } .bad { color:var(--bad); }
+  a { color:var(--acc); } .hint { color:var(--dim); margin-bottom:8px; }
+  code { background:#0b0e14; padding:2px 5px; border-radius:3px; user-select:all; }
+</style>
+</head>
+<body>
+<header>
+  <input id="bob" value="https://bob.qubic.global" title="bob base URL">
+  <input id="ident" placeholder="Identity (60 chars)" spellcheck="false">
+  <button id="load">Load tree</button>
+  <button id="refresh" title="Ignore cached scan position and rescan whole epoch">Rescan</button>
+  <button id="fit">Fit view</button>
+  <div id="status">Enter an identity and press Load.</div>
+</header>
+<main>
+  <div id="left"><div id="stats"></div><svg id="svg"><g id="vp"></g></svg>
+    <div id="legend">square = solution: score / L K &nbsp;|&nbsp; yellow = best &nbsp;|&nbsp; red dashed = rejected &nbsp;|&nbsp; wheel zoom, drag pan, click = details</div></div>
+  <div id="right"><div class="hint">Click a node to see its solution data.</div></div>
+</main>
+<script>
+'use strict';
+const ZERO_ID = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFXIB';
+const ANT_INPUT_TYPE = 12;
+const ANT_MAGIC_HEX = '414e545f534f4c55'; // "ANT_SOLU"
+const ROOT_KEY = '0:4294967295';
+const CACHE_TTL_MS = 7 * 24 * 3600 * 1000;
+const RESULT_NAMES = ['Valid','ValidNotStored','RejectParentNotRegistered','RejectStale','RejectWrongTree',
+  'RejectBelowThreshold','RejectLeParent','RejectMaxChildrenPerParent','RejectTickOutOfRange','RejectReplay',
+  'RejectDedupFull','RejectMinerIndexFull','RejectNonCanonicalNonce'];
+
+const $ = id => document.getElementById(id);
+const setStatus = t => { $('status').textContent = t; };
+
+// ---------- bob access ----------
+let base = '';
+async function getJson(path) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const r = await fetch(base + path);
+      if (!r.ok) throw new Error(`GET ${path} -> ${r.status}`);
+      return await r.json();
+    } catch (e) {
+      if (attempt >= 4) throw e;
+      await new Promise(res => setTimeout(res, 300 * (attempt + 1)));
+    }
+  }
+}
+// POST endpoints trigger a CORS preflight that bob rejects; WebSocket JSON-RPC has no such check.
+function rpcWs(method, params) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(base.replace(/^http/, 'ws') + '/ws/qubic');
+    ws.onopen = () => ws.send(JSON.stringify({ jsonrpc: '2.0', method, params, id: 1 }));
+    ws.onmessage = e => { ws.close(); const m = JSON.parse(e.data); m.error ? reject(new Error(JSON.stringify(m.error))) : resolve(m.result); };
+    ws.onerror = () => reject(new Error('websocket error'));
+  });
+}
+async function pool(items, n, fn, onDone) {
+  let i = 0; const out = new Array(items.length);
+  await Promise.all(Array.from({ length: n }, async () => {
+    while (i < items.length) { const k = i++; out[k] = await fn(items[k]); if (onDone) onDone(k); }
+  }));
+  return out;
+}
+
+// ---------- parsing ----------
+function identityToPubkeyHex(id) {
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 4; i++) {
+    let v = 0n;
+    for (let j = 13; j >= 0; j--) v = v * 26n + BigInt(id.charCodeAt(i * 14 + j) - 65);
+    for (let b = 0; b < 8; b++) { bytes[i * 8 + b] = Number(v & 0xffn); v >>= 8n; }
+  }
+  return hex(bytes);
+}
+const hex = b => Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+const unhex = h => Uint8Array.from(h.match(/../g), x => parseInt(x, 16));
+const u32le = (b, o) => (b[o] | b[o+1] << 8 | b[o+2] << 16 | b[o+3] << 24) >>> 0;
+
+function parseTxInput(inputHex) { // parentTick, parentIdx, anchorTick, claimedScore, nonce
+  const b = unhex(inputHex);
+  return { parentTick: u32le(b, 0), parentIdx: u32le(b, 4), anchorTick: u32le(b, 8), claimedScore: u32le(b, 12), nonce: hex(b.slice(16, 48)) };
+}
+function parseAntLog(bodyHex) { // AntSolutionLogMessage, 92 bytes
+  const b = unhex(bodyHex);
+  return { pubkey: hex(b.slice(8, 40)), nonce: hex(b.slice(40, 72)), parentTick: u32le(b, 72), parentIdx: u32le(b, 76),
+    anchorTick: u32le(b, 80), score: u32le(b, 84), result: u32le(b, 88) };
+}
+function nonceInfo(n) {
+  const b = unhex(n);
+  return { algo: b[0], L: b[1], K: b[2], seed: hex(b.slice(3)) };
+}
+
+// ---------- cache ----------
+const cacheKey = (epoch, id) => `ant:${epoch}:${id}`;
+function loadCache(epoch, id) {
+  try {
+    const c = JSON.parse(localStorage.getItem(cacheKey(epoch, id)));
+    if (c && Date.now() - c.ts < CACHE_TTL_MS) return c;
+  } catch (e) {}
+  return null;
+}
+function saveCache(epoch, id, c) {
+  try { localStorage.setItem(cacheKey(epoch, id), JSON.stringify(c)); } catch (e) { console.warn('cache save failed', e); }
+}
+
+// ---------- fetch pipeline ----------
+// One global limiter over every request: bob resets connections beyond ~48 in flight,
+// browsers cap HTTP/1.1 at 6 per host anyway. Flat queue avoids per-tick head-of-line blocking.
+const MAX_INFLIGHT = 12;
+let inflight = 0; const waiters = [];
+async function limited(fn) {
+  if (inflight >= MAX_INFLIGHT) await new Promise(r => waiters.push(r));
+  inflight++;
+  try { return await fn(); } finally { inflight--; const w = waiters.shift(); if (w) w(); }
+}
+const getL = path => limited(() => getJson(path));
+
+async function solutionFromTx(tx, epoch, id) {
+  if (tx.from !== id || tx.inputType !== ANT_INPUT_TYPE) return null;
+  const inp = parseTxInput(tx.inputData);
+  const s = { key: `${tx.tick}:${tx.transactionIndex}`, tick: tx.tick, idx: tx.transactionIndex, txHash: tx.hash, timestamp: tx.timestamp,
+    amount: tx.amount, executed: tx.executed, txStatus: tx.status, logIdFrom: tx.logIdFrom, logIdTo: tx.logIdTo, ...inp, log: null, refunded: false };
+  if (tx.logIdFrom !== undefined && tx.logIdTo >= tx.logIdFrom) {
+    const logs = await getL(`/log/${epoch}/${tx.logIdFrom}/${tx.logIdTo}`);
+    for (const l of logs) {
+      if (l.type === 255 && l.body && l.body.hex && l.body.hex.startsWith(ANT_MAGIC_HEX)) s.log = parseAntLog(l.body.hex);
+      if (l.type === 0 && l.body && l.body.from === ZERO_ID && l.body.to === id && l.body.amount === tx.amount) s.refunded = true;
+    }
+  }
+  return s;
+}
+async function fetchSolutionsInTick(tick, epoch, id, onSol) {
+  const td = (await getL(`/tick/${tick}`)).tickdata;
+  const digests = (td && td.transactionDigests) || [];
+  await Promise.all(digests.map(async h => {
+    const s = await solutionFromTx(await getL(`/tx/${h}`), epoch, id);
+    if (s) onSol(s);
+  }));
+}
+
+async function loadIdentity(id, rescan, onProgress) {
+  const st = await getJson('/status');
+  const epoch = st.currentProcessingEpoch, fromEpoch = st.initialTick, toTick = st.currentIndexingTick;
+  let c = rescan ? null : loadCache(epoch, id);
+  if (!c) c = { ts: Date.now(), epoch, scannedTo: fromEpoch - 1, sols: {} };
+  const fromTick = c.scannedTo + 1;
+  const count = () => Object.keys(c.sols).length;
+  onProgress(c.sols);
+  setStatus(`epoch ${epoch}, ticks ${fromEpoch}..${toTick}. cached solutions: ${count()}. scanning ${fromTick}..${toTick} ...`);
+  let ticks = [];
+  if (fromTick <= toTick) {
+    ticks = await rpcWs('qubic_findLogIds', [{ scIndex: 0, logType: 0, fromTick, toTick, topic1: id, topic2: ZERO_ID, topic3: ZERO_ID }]);
+  }
+  let done = 0;
+  const onSol = s => { c.sols[s.key] = s; onProgress(c.sols); };
+  await pool(ticks, 4, async t => {
+    await fetchSolutionsInTick(t, epoch, id, onSol);
+    if (++done % 20 === 0) saveCache(epoch, id, c);
+    setStatus(`epoch ${epoch}, ticks ${fromEpoch}..${toTick}. fetched ${done}/${ticks.length} ticks, ${count()} solutions`);
+  });
+  c.scannedTo = toTick;
+  saveCache(epoch, id, c);
+  setStatus(`epoch ${epoch}, ticks ${fromEpoch}..${toTick}. ${count()} solution txs (cached 7 days, rescans only new ticks).`);
+  return { epoch, sols: Object.values(c.sols) };
+}
+
+// ---------- tree ----------
+function buildTree(sols) {
+  const nodes = new Map();
+  for (const s of sols) {
+    const accepted = s.log && (s.log.result === 0 || s.log.result === 1);
+    nodes.set(s.key, { key: s.key, s, accepted, children: [], depth: 0 });
+  }
+  const root = { key: ROOT_KEY, s: null, accepted: true, children: [], depth: 0, isRoot: true };
+  const orphans = [];
+  for (const n of nodes.values()) {
+    const pk = `${n.s.parentTick}:${n.s.parentIdx}`;
+    const p = pk === ROOT_KEY ? root : nodes.get(pk);
+    if (p) p.children.push(n); else { n.orphan = true; orphans.push(n); }
+  }
+  const stack = [root];
+  while (stack.length) { const n = stack.pop(); for (const ch of n.children) { ch.depth = n.depth + 1; stack.push(ch); } }
+  const sortRec = n => { n.children.sort((a, b) => (a.accepted !== b.accepted) ? (a.accepted ? -1 : 1) : (a.s.log ? a.s.log.score : 1e9) - (b.s.log ? b.s.log.score : 1e9)); n.children.forEach(sortRec); };
+  sortRec(root);
+  return { root, orphans, nodes };
+}
+
+// Progressive render: tree is rebuilt while ticks arrive; pan/zoom and selection survive rebuilds.
+let treeData = null, curId = '', selectedKey = null;
+let renderTimer = null, pendingSols = null, autoFit = true; // auto-fit until the user pans or zooms
+function scheduleRender(sols) {
+  pendingSols = sols;
+  if (renderTimer) return;
+  renderTimer = setTimeout(() => { renderTimer = null; treeData = buildTree(Object.values(pendingSols)); renderTree(treeData); }, 300);
+}
+
+// ---------- layout (tidy tree: leaves left to right, parent centred over children) ----------
+const NW = 64, NH = 36, GX = 14, GY = 46;
+function layout(roots) {
+  let cursor = 0, maxY = 0;
+  const place = (n, depth) => {
+    n.y = depth * (NH + GY); maxY = Math.max(maxY, n.y);
+    if (!n.children.length) { n.x = cursor; cursor += NW + GX; return; }
+    for (const ch of n.children) place(ch, depth + 1);
+    n.x = (n.children[0].x + n.children[n.children.length - 1].x) / 2;
+  };
+  for (const r of roots) { place(r, 0); cursor += NW; }
+  return { w: cursor, h: maxY + NH };
+}
+function* walk(n) { yield n; for (const c of n.children) yield* walk(c); }
+
+// ---------- pan / zoom ----------
+const view = { x: 20, y: 20, k: 1 };
+let lastBounds = { w: 1, h: 1 };
+const SVG = 'http://www.w3.org/2000/svg';
+function applyView() { $('vp').setAttribute('transform', `translate(${view.x},${view.y}) scale(${view.k})`); }
+function fitView(bounds) {
+  const r = $('svg').getBoundingClientRect();
+  const k = Math.min(1.5, (r.width - 40) / Math.max(1, bounds.w), (r.height - 60) / Math.max(1, bounds.h));
+  view.k = Math.max(0.02, k); view.x = (r.width - bounds.w * view.k) / 2; view.y = 40; applyView();
+}
+function centerOn(n) {
+  const r = $('svg').getBoundingClientRect();
+  autoFit = false; view.k = Math.max(view.k, 0.8);
+  view.x = r.width / 2 - (n.x + NW / 2) * view.k; view.y = r.height / 2 - (n.y + NH / 2) * view.k; applyView();
+}
+{
+  const svg = $('svg'); let drag = null;
+  svg.addEventListener('wheel', e => {
+    e.preventDefault(); autoFit = false;
+    const f = Math.exp(-e.deltaY * 0.0015), r = svg.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+    view.x = mx - (mx - view.x) * f; view.y = my - (my - view.y) * f; view.k *= f; applyView();
+  }, { passive: false });
+  svg.addEventListener('mousedown', e => { autoFit = false; drag = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y }; svg.classList.add('drag'); });
+  window.addEventListener('mousemove', e => { if (!drag) return; view.x = drag.vx + e.clientX - drag.x; view.y = drag.vy + e.clientY - drag.y; applyView(); });
+  window.addEventListener('mouseup', () => { drag = null; svg.classList.remove('drag'); });
+}
+
+// ---------- svg render ----------
+function el(tag, attrs, text) {
+  const e = document.createElementNS(SVG, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+function renderTree(t) {
+  const acc = [...t.nodes.values()].filter(n => n.accepted);
+  const best = acc.length ? acc.reduce((a, b) => a.s.log.score < b.s.log.score ? a : b) : null;
+  const maxDepth = Math.max(0, ...acc.map(n => n.depth));
+  $('stats').textContent = `accepted ${acc.length} | rejected ${t.nodes.size - acc.length} | max depth ${maxDepth}` +
+    (best ? ` | best score ${best.s.log.score} @ ${best.key}` : '') + (t.orphans.length ? ` | orphans (parent not found) ${t.orphans.length}` : '');
+  const roots = [t.root];
+  if (t.orphans.length) roots.push({ key: 'orphans', isRoot: true, accepted: true, children: t.orphans, depth: 0, label: 'ORPHANS' });
+  const bounds = layout(roots);
+  const edges = el('g', {}), nodes = el('g', {});
+  for (const r of roots) for (const n of walk(r)) {
+    for (const ch of n.children) {
+      const x1 = n.x + NW / 2, y1 = n.y + NH, x2 = ch.x + NW / 2, y2 = ch.y, ym = (y1 + y2) / 2;
+      edges.appendChild(el('path', { class: 'edge' + (ch.accepted ? '' : ' rej'), d: `M${x1},${y1} C${x1},${ym} ${x2},${ym} ${x2},${y2}` }));
+    }
+    const g = el('g', { class: 'node' + (n.isRoot ? ' root' : '') + (n.accepted ? '' : ' rej') + (n === best ? ' best' : '') + (n.key === selectedKey ? ' sel' : ''),
+      transform: `translate(${n.x},${n.y})`, 'data-k': n.key });
+    g.appendChild(el('rect', { width: NW, height: NH }));
+    if (n.isRoot) {
+      g.appendChild(el('text', { class: 'sc', x: NW / 2, y: 23 }, n.label || 'ROOT'));
+    } else {
+      const ni = nonceInfo(n.s.nonce);
+      g.appendChild(el('text', { class: 'sc', x: NW / 2, y: 16 }, n.s.log ? n.s.log.score : '?'));
+      g.appendChild(el('text', { class: 'lk', x: NW / 2, y: 30 }, `L${ni.L} K${ni.K}  d${n.depth}`));
+      g.appendChild(el('title', {}, `${n.key}\nscore ${n.s.log ? n.s.log.score : '?'}  depth ${n.depth}\n${n.s.log ? RESULT_NAMES[n.s.log.result] : 'no log'}`));
+    }
+    g.addEventListener('click', e => { e.stopPropagation(); selectKey(n.key, false); });
+    nodes.appendChild(g);
+  }
+  $('vp').replaceChildren(edges, nodes);
+  lastBounds = bounds;
+  if (autoFit) fitView(bounds); else applyView();
+}
+function selectKey(key, scroll) {
+  const n = key === ROOT_KEY ? treeData.root : treeData.nodes.get(key);
+  if (!n) return;
+  selectedKey = key;
+  showDetail(n);
+  document.querySelectorAll('#vp .node.sel').forEach(g => g.classList.remove('sel'));
+  const g = document.querySelector(`#vp .node[data-k="${key}"]`);
+  if (g) g.classList.add('sel');
+  if (scroll) centerOn(n);
+}
+
+// ---------- detail ----------
+const esc = s => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+function showDetail(n) {
+  const r = $('right');
+  if (n.isRoot) {
+    r.innerHTML = `<h3>${esc(n.label || 'Virtual root')}</h3><div class="hint">${n.label ? 'Solutions whose parentRef was not found among this identity\'s solutions in this epoch.' :
+      'Shared per-epoch root derived from the epoch spectrum digest. Never stored or submitted. Children: ' + n.children.length + '.'}</div>`;
+    return;
+  }
+  const s = n.s, L = s.log, ni = nonceInfo(s.nonce);
+  const row = (k, v) => `<tr><td>${k}</td><td>${v}</td></tr>`;
+  const resName = L ? (RESULT_NAMES[L.result] || String(L.result)) : 'no ANT_SOLU log found';
+  const parentKey = `${s.parentTick}:${s.parentIdx}`;
+  const parent = treeData.nodes.get(parentKey);
+  const kids = n.children.map(c => `<a href="#" data-k="${c.key}">${c.key}</a> (${c.s.log ? c.s.log.score : '?'}${c.accepted ? '' : ', rejected'})`).join('<br>') || '-';
+  r.innerHTML = `<h3>Solution ${esc(s.key)} <span class="${n.accepted ? 'ok' : 'bad'}">${esc(resName)}</span></h3><table>` +
+    row('identity', esc(curId)) +
+    row('pubkey (hex)', L ? L.pubkey : identityToPubkeyHex(curId)) +
+    row('selfRef (tick:index)', `${s.tick}:${s.idx}`) +
+    row('parentRef', parentKey === ROOT_KEY ? `${parentKey} (ROOT)` : (parent ? `<a href="#" data-k="${parentKey}">${parentKey}</a>` : parentKey + ' (not found)')) +
+    row('depth', n.depth + (n.orphan ? ' (orphan, unknown)' : '')) +
+    row('children', kids) +
+    row('score (node computed)', L ? `${L.score}` : '-') +
+    row('claimed score (tx)', `${s.claimedScore}` + (L && L.score !== s.claimedScore ? ' <span class="bad">mismatch</span>' : '')) +
+    row('parent score', parent && parent.s.log ? parent.s.log.score : (parentKey === ROOT_KEY ? 'root' : '-')) +
+    row('result', esc(resName) + (L ? ` (${L.result})` : '')) +
+    row('anchor tick', `${s.anchorTick} (published ${s.tick - s.anchorTick} ticks after anchor)`) +
+    row('publish tick', `${s.tick}`) +
+    row('timestamp', s.timestamp ? new Date(s.timestamp * 1000).toISOString() : '-') +
+    row('nonce (hex)', s.nonce) +
+    row('nonce algo / L / K', `${ni.algo} / ${ni.L} / ${ni.K}`) +
+    row('nonce seed (bytes 3..31)', ni.seed) +
+    row('tx hash', esc(s.txHash)) +
+    row('tx executed / status', `${s.executed} / ${esc(s.txStatus)}`) +
+    row('deposit', `${s.amount} QU, refunded: <span class="${s.refunded ? 'ok' : 'bad'}">${s.refunded}</span>`) +
+    row('log ids', `${s.logIdFrom}..${s.logIdTo}`) +
+    row('log pubkey/nonce match tx', L ? String(L.nonce === s.nonce && L.parentTick === s.parentTick && L.parentIdx === s.parentIdx && L.anchorTick === s.anchorTick) : '-') +
+    `</table>`;
+  r.querySelectorAll('a[data-k]').forEach(a => a.onclick = e => { e.preventDefault(); selectKey(a.dataset.k, true); });
+}
+// ---------- mixed content help ----------
+const isMixed = () => location.protocol === 'https:' && /^http:/.test(base);
+function mixedContentHelp(failed) {
+  const site = encodeURIComponent(location.origin);
+  return `<h3 class="${failed ? 'bad' : ''}">${failed ? 'Request blocked: ' : ''}this page is HTTPS, bob is HTTP</h3>
+<div class="hint">Browsers block plain-HTTP requests (mixed content) from an HTTPS page. Bob at <b>${esc(base)}</b> has no HTTPS,
+so you must allow insecure content for this site once. Then press Load again.</div>
+<table>
+<tr><td>Chrome / Brave</td><td>Open this address in a new tab (copy it, chrome:// links cannot be clicked):<br>
+<code>chrome://settings/content/siteDetails?site=${site}</code><br>
+then set <b>Insecure content</b> to <b>Allow</b> and reload this page.<br>
+Or: click the lock/tune icon left of the address bar → Site settings → Insecure content → Allow.</td></tr>
+<tr><td>Edge</td><td><code>edge://settings/content/siteDetails?site=${site}</code> → Insecure content → Allow.</td></tr>
+<tr><td>Firefox</td><td>No per-site switch. Open <code>about:config</code>, set <code>security.mixed_content.block_active_content</code> to <b>false</b> (global, remember to revert).</td></tr>
+<tr><td>Safari</td><td>Not possible. Use Chrome, or open the page over http.</td></tr>
+<tr><td>Alternative</td><td>Enter an https:// bob endpoint in the URL box, or open this page from a plain http:// host.</td></tr>
+</table>`;
+}
+
+// ---------- ui ----------
+async function run(rescan) {
+  const id = $('ident').value.trim().toUpperCase();
+  if (!/^[A-Z]{60}$/.test(id)) { setStatus('Identity must be 60 letters A-Z.'); return; }
+  base = $('bob').value.trim().replace(/\/$/, '');
+  if (isMixed() && !$('right').dataset.mixedShown) { $('right').innerHTML = mixedContentHelp(false); $('right').dataset.mixedShown = '1'; }
+  curId = id; $('load').disabled = $('refresh').disabled = true;
+  selectedKey = null; treeData = null; autoFit = true;
+  $('vp').replaceChildren(); $('stats').textContent = '';
+  try {
+    const { sols } = await loadIdentity(id, rescan, scheduleRender);
+    clearTimeout(renderTimer); renderTimer = null;
+    treeData = buildTree(sols);
+    renderTree(treeData);
+    location.hash = id;
+  } catch (e) {
+    setStatus('Error: ' + e.message); console.error(e);
+    if (isMixed()) $('right').innerHTML = mixedContentHelp(true);
+  }
+  $('load').disabled = $('refresh').disabled = false;
+}
+$('load').onclick = () => run(false);
+$('refresh').onclick = () => run(true);
+$('fit').onclick = () => fitView(lastBounds);
+$('ident').onkeydown = e => { if (e.key === 'Enter') run(false); };
+if (location.hash.length === 61) { $('ident').value = location.hash.slice(1); run(false); }
+</script>
+</body>
+</html>
