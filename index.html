@@ -50,7 +50,7 @@
 </header>
 <main>
   <div id="left"><div id="stats"></div><svg id="svg"><g id="vp"></g></svg>
-    <div id="legend">square = solution: score / L K &nbsp;|&nbsp; yellow = best &nbsp;|&nbsp; red dashed = rejected &nbsp;|&nbsp; wheel zoom, drag pan, click = details</div></div>
+    <div id="legend">square = solution: [s=shift lower bound] error / mode(S start, W wiring, T LUTs) L K depth &nbsp;|&nbsp; yellow = best &nbsp;|&nbsp; red dashed = rejected &nbsp;|&nbsp; wheel zoom, drag pan, click = details</div></div>
   <div id="right"><div class="hint">Click a node to see its solution data.</div></div>
 </main>
 <script>
@@ -123,8 +123,10 @@ function parseAntLog(bodyHex) { // AntSolutionLogMessage, 92 bytes
 }
 function nonceInfo(n) {
   const b = unhex(n);
-  return { algo: b[0], L: b[1], K: b[2], seed: hex(b.slice(3)) };
+  return { algo: b[0], L: b[1] & 0x0f, mode: (b[1] >> 4) & 3, K: b[2], seed: hex(b.slice(3)) };
 }
+const MODE_NAMES = ['?', 'start state', 'wiring', 'LUTs'];
+const MODE_SHORT = ['?', 'S', 'W', 'T'];
 
 // ---------- cache ----------
 const cacheKey = (epoch, id) => `ant:${epoch}:${id}`;
@@ -201,6 +203,9 @@ async function loadIdentity(id, rescan, onProgress) {
 }
 
 // ---------- tree ----------
+// Rating order: higher shift first, then lower error. Negative = a is better.
+const errOf = n => n.s && n.s.log ? n.s.log.score : 1e9;
+const ratingCmp = (a, b) => (b.minShift - a.minShift) || (errOf(a) - errOf(b));
 function buildTree(sols) {
   const nodes = new Map();
   for (const s of sols) {
@@ -215,8 +220,19 @@ function buildTree(sols) {
     if (p) p.children.push(n); else { n.orphan = true; orphans.push(n); }
   }
   const stack = [root];
-  while (stack.length) { const n = stack.pop(); for (const ch of n.children) { ch.depth = n.depth + 1; stack.push(ch); } }
-  const sortRec = n => { n.children.sort((a, b) => (a.accepted !== b.accepted) ? (a.accepted ? -1 : 1) : (a.s.log ? a.s.log.score : 1e9) - (b.s.log ? b.s.log.score : 1e9)); n.children.forEach(sortRec); };
+  // Shift is not on-chain; accepted child with error >= parent error must have advanced shift.
+  root.minShift = 0;
+  while (stack.length) {
+    const n = stack.pop();
+    for (const ch of n.children) {
+      ch.depth = n.depth + 1;
+      const pe = n.isRoot ? Infinity : (n.s.log ? n.s.log.score : Infinity);
+      ch.minShift = n.minShift + (ch.accepted && ch.s.log && ch.s.log.score >= pe ? 1 : 0);
+      stack.push(ch);
+    }
+  }
+  for (const o of orphans) if (o.minShift === undefined) o.minShift = 0;
+  const sortRec = n => { n.children.sort((a, b) => (a.accepted !== b.accepted) ? (a.accepted ? -1 : 1) : ratingCmp(a, b)); n.children.forEach(sortRec); };
   sortRec(root);
   return { root, orphans, nodes };
 }
@@ -231,7 +247,7 @@ function scheduleRender(sols) {
 }
 
 // ---------- layout (tidy tree: leaves left to right, parent centred over children) ----------
-const NW = 64, NH = 36, GX = 14, GY = 46;
+const NW = 84, NH = 36, GX = 14, GY = 46;
 function layout(roots) {
   let cursor = 0, maxY = 0;
   const place = (n, depth) => {
@@ -281,10 +297,10 @@ function el(tag, attrs, text) {
 }
 function renderTree(t) {
   const acc = [...t.nodes.values()].filter(n => n.accepted);
-  const best = acc.length ? acc.reduce((a, b) => a.s.log.score < b.s.log.score ? a : b) : null;
+  const best = acc.length ? acc.reduce((a, b) => ratingCmp(b, a) < 0 ? b : a) : null;
   const maxDepth = Math.max(0, ...acc.map(n => n.depth));
   $('stats').textContent = `accepted ${acc.length} | rejected ${t.nodes.size - acc.length} | max depth ${maxDepth}` +
-    (best ? ` | best score ${best.s.log.score} @ ${best.key}` : '') + (t.orphans.length ? ` | orphans (parent not found) ${t.orphans.length}` : '');
+    (best ? ` | best shift>=${best.minShift} error ${best.s.log.score} @ ${best.key}` : '') + (t.orphans.length ? ` | orphans (parent not found) ${t.orphans.length}` : '');
   const roots = [t.root];
   if (t.orphans.length) roots.push({ key: 'orphans', isRoot: true, accepted: true, children: t.orphans, depth: 0, label: 'ORPHANS' });
   const bounds = layout(roots);
@@ -301,9 +317,9 @@ function renderTree(t) {
       g.appendChild(el('text', { class: 'sc', x: NW / 2, y: 23 }, n.label || 'ROOT'));
     } else {
       const ni = nonceInfo(n.s.nonce);
-      g.appendChild(el('text', { class: 'sc', x: NW / 2, y: 16 }, n.s.log ? n.s.log.score : '?'));
-      g.appendChild(el('text', { class: 'lk', x: NW / 2, y: 30 }, `L${ni.L} K${ni.K}  d${n.depth}`));
-      g.appendChild(el('title', {}, `${n.key}\nscore ${n.s.log ? n.s.log.score : '?'}  depth ${n.depth}\n${n.s.log ? RESULT_NAMES[n.s.log.result] : 'no log'}`));
+      g.appendChild(el('text', { class: 'sc', x: NW / 2, y: 16 }, (n.minShift ? `s${n.minShift}+ ` : '') + (n.s.log ? n.s.log.score : '?')));
+      g.appendChild(el('text', { class: 'lk', x: NW / 2, y: 30 }, `${MODE_SHORT[ni.mode]} L${ni.L} K${ni.K} d${n.depth}`));
+      g.appendChild(el('title', {}, `${n.key}\nerror ${n.s.log ? n.s.log.score : '?'}  shift >= ${n.minShift}  depth ${n.depth}\nmode ${MODE_NAMES[ni.mode]}  L ${ni.L}  K ${ni.K}\n${n.s.log ? RESULT_NAMES[n.s.log.result] : 'no log'}`));
     }
     g.addEventListener('click', e => { e.stopPropagation(); selectKey(n.key, false); });
     nodes.appendChild(g);
@@ -345,15 +361,16 @@ function showDetail(n) {
     row('parentRef', parentKey === ROOT_KEY ? `${parentKey} (ROOT)` : (parent ? `<a href="#" data-k="${parentKey}">${parentKey}</a>` : parentKey + ' (not found)')) +
     row('depth', n.depth + (n.orphan ? ' (orphan, unknown)' : '')) +
     row('children', kids) +
-    row('score (node computed)', L ? `${L.score}` : '-') +
-    row('claimed score (tx)', `${s.claimedScore}` + (L && L.score !== s.claimedScore ? ' <span class="bad">mismatch</span>' : '')) +
-    row('parent score', parent && parent.s.log ? parent.s.log.score : (parentKey === ROOT_KEY ? 'root' : '-')) +
+    row('error (node computed)', L ? `${L.score}` : '-') +
+    row('shift (inferred)', `&gt;= ${n.minShift} <span class="hint">(not on-chain; +1 each step whose error is not below its parent's)</span>`) +
+    row('claimed error (tx)', `${s.claimedScore}` + (L && L.score !== s.claimedScore ? ' <span class="bad">mismatch</span>' : '')) +
+    row('parent error / shift', parent && parent.s.log ? `${parent.s.log.score} / &gt;= ${parent.minShift}` : (parentKey === ROOT_KEY ? 'root' : '-')) +
     row('result', esc(resName) + (L ? ` (${L.result})` : '')) +
     row('anchor tick', `${s.anchorTick} (published ${s.tick - s.anchorTick} ticks after anchor)`) +
     row('publish tick', `${s.tick}`) +
     row('timestamp', s.timestamp ? new Date(s.timestamp * 1000).toISOString() : '-') +
     row('nonce (hex)', s.nonce) +
-    row('nonce algo / L / K', `${ni.algo} / ${ni.L} / ${ni.K}`) +
+    row('nonce algo / mode / L / K', `${ni.algo} / ${ni.mode} (${MODE_NAMES[ni.mode]}) / ${ni.L} / ${ni.K}`) +
     row('nonce seed (bytes 3..31)', ni.seed) +
     row('tx hash', esc(s.txHash)) +
     row('tx executed / status', `${s.executed} / ${esc(s.txStatus)}`) +
