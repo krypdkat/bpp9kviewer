@@ -427,19 +427,51 @@ async function getJson(path) {
       if (!r.ok) throw new Error(`GET ${path} -> ${r.status}`);
       return await r.json();
     } catch (e) {
-      if (attempt >= 4) throw e;
-      await new Promise(res => setTimeout(res, 300 * (attempt + 1)));
+      if (attempt >= 7) throw e;
+      await new Promise(res => setTimeout(res, Math.min(8000, 400 * 2 ** attempt)));
     }
   }
 }
 // POST endpoints trigger a CORS preflight that bob rejects; WebSocket JSON-RPC has no such check.
-function rpcWs(method, params) {
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(base.replace(/^http/, 'ws') + '/ws/qubic');
-    ws.onopen = () => ws.send(JSON.stringify({ jsonrpc: '2.0', method, params, id: 1 }));
-    ws.onmessage = e => { ws.close(); const m = JSON.parse(e.data); m.error ? reject(new Error(JSON.stringify(m.error))) : resolve(m.result); };
-    ws.onerror = () => reject(new Error('websocket error'));
+// One shared socket, replies matched by id. More sockets overload bob (HTTP 520).
+let wsP = null, wsUrl = '', wsId = 0; const wsWait = new Map();
+function wsOpen() {
+  const url = base.replace(/^http/, 'ws') + '/ws/qubic';
+  if (wsP && wsUrl === url) return wsP;
+  wsUrl = url;
+  const me = wsP = new Promise((resolve, reject) => {
+    const ws = new WebSocket(url);
+    const fail = () => {
+      if (wsP === me) wsP = null;
+      for (const w of wsWait.values()) w.reject(new Error('websocket error'));
+      wsWait.clear(); reject(new Error('websocket error'));
+    };
+    ws.onopen = () => resolve(ws);
+    ws.onmessage = e => {
+      const m = JSON.parse(e.data), w = wsWait.get(m.id);
+      if (!w) return;
+      wsWait.delete(m.id); m.error ? w.reject(new Error(JSON.stringify(m.error))) : w.resolve(m.result);
+    };
+    ws.onerror = fail; ws.onclose = fail;
   });
+  return me;
+}
+async function rpcWs(method, params) {
+  for (let attempt = 0; ; attempt++) {
+    const id = ++wsId;
+    try {
+      const ws = await wsOpen();
+      return await new Promise((resolve, reject) => {
+        wsWait.set(id, { resolve, reject });
+        ws.send(JSON.stringify({ jsonrpc: '2.0', method, params, id }));
+        setTimeout(() => reject(new Error('websocket timeout')), 60000);
+      });
+    } catch (e) {
+      wsWait.delete(id);
+      if (attempt >= 4) throw e;
+      await new Promise(res => setTimeout(res, 300 * (attempt + 1)));
+    }
+  }
 }
 async function pool(items, n, fn, onDone) {
   let i = 0; const out = new Array(items.length);
@@ -495,7 +527,7 @@ function saveCache(epoch, id, c) {
 // ---------- fetch pipeline ----------
 // One global limiter over every request: bob resets connections beyond ~48 in flight,
 // browsers cap HTTP/1.1 at 6 per host anyway. Flat queue avoids per-tick head-of-line blocking.
-const MAX_INFLIGHT = 12;
+const MAX_INFLIGHT = 32;
 let inflight = 0; const waiters = [];
 async function limited(fn) {
   if (inflight >= MAX_INFLIGHT) await new Promise(r => waiters.push(r));
@@ -518,15 +550,6 @@ async function solutionFromTx(tx, epoch, id) {
   }
   return s;
 }
-async function fetchSolutionsInTick(tick, epoch, id, onSol) {
-  const td = (await getL(`/tick/${tick}`)).tickdata;
-  const digests = (td && td.transactionDigests) || [];
-  await Promise.all(digests.map(async h => {
-    const s = await solutionFromTx(await getL(`/tx/${h}`), epoch, id);
-    if (s) onSol(s);
-  }));
-}
-
 async function loadIdentity(id, rescan, onProgress) {
   const st = await getJson('/status');
   const want = +$('epochIn').value || st.currentProcessingEpoch;
@@ -543,17 +566,27 @@ async function loadIdentity(id, rescan, onProgress) {
   const count = () => Object.keys(c.sols).length;
   onProgress(c.sols);
   setStatus(`epoch ${epoch}, ticks ${fromEpoch}..${toTick}. cached solutions: ${count()}. scanning ${fromTick}..${toTick} ...`);
-  let ticks = [];
-  if (fromTick <= toTick) {
-    ticks = await rpcWs('qubic_findLogIds', [{ scIndex: 0, logType: 0, fromTick, toTick, topic1: id, topic2: ZERO_ID, topic3: ZERO_ID }]);
-  }
-  let done = 0;
-  const onSol = s => { c.sols[s.key] = s; onProgress(c.sols); };
-  await pool(ticks, 4, async t => {
-    await fetchSolutionsInTick(t, epoch, id, onSol);
-    if (++done % 20 === 0) saveCache(epoch, id, c);
-    setStatus(`epoch ${epoch}, ticks ${fromEpoch}..${toTick}. fetched ${done}/${ticks.length} ticks, ${count()} solutions`);
+  // bob lists an identity's outgoing transfer txs per window of at most 1000 ticks
+  const ticks = fromTick <= toTick ? await rpcWs('qubic_findLogIds', [{ scIndex: 0, logType: 0, fromTick, toTick, topic1: id, topic2: ZERO_ID, topic3: ZERO_ID }]) : [];
+  // only windows that hold a solution tick
+  const wins = [...new Set(ticks.map(t => fromTick + Math.floor((t - fromTick) / 1000) * 1000))].sort((a, b) => a - b);
+  let done = 0, txLeft = 0; const txJobs = [];
+  const have = new Set(Object.values(c.sols).map(s => s.txHash)); // resume after a failed load
+  const progress = () => setStatus(`epoch ${epoch}, ticks ${fromEpoch}..${toTick}. scanned ${done}/${wins.length} tick windows, ${count()} solutions, ${txLeft} txs pending`);
+  await pool(wins, 8, async t => {
+    const r = await rpcWs('qubic_getQuTransfers', [{ identity: id, fromTick: t, toTick: Math.min(t + 999, toTick) }]);
+    if (!r || !r.out) throw new Error('bob transfer list failed: ' + JSON.stringify(r));
+    const todo = r.out.filter(h => !have.has(h));
+    txLeft += todo.length;
+    for (const h of todo) txJobs.push((async () => {
+      const s = await solutionFromTx(await getL(`/tx/${h}`), epoch, id);
+      if (s) { c.sols[s.key] = s; onProgress(c.sols); }
+      if (--txLeft % 200 === 0) saveCache(epoch, id, c);
+      progress();
+    })());
+    done++; progress();
   });
+  try { await Promise.all(txJobs); } finally { saveCache(epoch, id, c); }
   c.scannedTo = toTick;
   saveCache(epoch, id, c);
   setStatus(`epoch ${epoch}, ticks ${fromEpoch}..${toTick}. ${count()} solution txs (cached 7 days, rescans only new ticks).`);
